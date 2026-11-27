@@ -2,6 +2,8 @@ import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import * as Variables from "@spinframework/spin-variables";
 import { AutoRouter as Router } from "itty-router";
 
+const BATCH_LOG_BYTES = 1024 * 1024; // emit one log line per ~1MB of chunks
+
 let router = Router();
 
 router.get('/stream/:bucket/:file', async ({ bucket, file }) => {
@@ -31,32 +33,70 @@ router.get('/stream/:bucket/:file', async ({ bucket, file }) => {
     headers.set('Content-Type', data.ContentType || 'application/octet-stream');
     if (data.ContentLength) headers.set('Content-Length', data.ContentLength.toString());
 
-    // Create a TransformStream to prepend text on each chunk
-    let prependText = "\n\n\nbeginning of chunk>>>: \n\n\n\n";
-    let appendText = "\n\n\nend of chunk<<<\n\n\n\n";
-    let textEncoder = new TextEncoder();
-    let textDecoder = new TextDecoder();
+    // Chunks are grouped into batches of >= 1MB. Received and sent use the same
+    // chunk boundaries, so batch N covers the same bytes in both log streams.
+    const batchLogger = (label: string) => {
+        let batchIndex = 0;
+        let batchChunks = 0;
+        let batchBytes = 0;
+        let totalBytes = 0;
+        const emit = () => {
+            console.log(`[batch #${batchIndex}] ${label}: ${batchChunks} chunks, ${batchBytes} bytes in batch, ${totalBytes} bytes cumulative`);
+            batchIndex++;
+            batchChunks = 0;
+            batchBytes = 0;
+        };
+        return {
+            add(size: number) {
+                batchChunks++;
+                batchBytes += size;
+                totalBytes += size;
+                if (batchBytes >= BATCH_LOG_BYTES) emit();
+            },
+            // Emit any partial batch left at the end of the stream
+            flush() {
+                if (batchChunks > 0) emit();
+            },
+        };
+    };
 
-    const transformStream = new TransformStream<Uint8Array, Uint8Array>({
+    const receivedLog = batchLogger('received');
+    const sentLog = batchLogger('sent');
+
+    // Pass chunks along unchanged, logging what we receive from S3
+    const logStream = new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
-            // Decode chunk to text
-            let originalText = textDecoder.decode(chunk);
-
-            let text = prependText + originalText + appendText;
-
-            // Re-encode to Uint8Array
-            let reEncodedChunk = textEncoder.encode(text);
-
-            // Enqueue the modified chunk
-            controller.enqueue(reEncodedChunk);
+            receivedLog.add(chunk.length);
+            controller.enqueue(chunk);
+        },
+        flush() {
+            receivedLog.flush();
         },
     });
 
-    // Pipe the original stream through our transform
-    const pipedStream = stream.pipeThrough(transformStream);
+    // Client-facing stream: pull() runs only when the runtime asks for the next
+    // chunk to send, so the log fires as chunks are handed to the client
+    const reader = stream.pipeThrough(logStream).getReader();
+    const clientStream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            const { done, value } = await reader.read();
+            if (done) {
+                sentLog.flush();
+                controller.close();
+                return;
+            }
+            sentLog.add(value.length);
+            controller.enqueue(value);
+        },
+        cancel(reason) {
+            sentLog.flush();
+            console.log('Client cancelled before the stream completed');
+            return reader.cancel(reason);
+        },
+    });
 
-    // Return the streamed response
-    return new Response(pipedStream, {
+    // Return the S3 body streamed through to the client
+    return new Response(clientStream, {
         status: 200,
         headers,
     });

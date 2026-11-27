@@ -18,8 +18,8 @@ component = "linode-object-storage-streaming"
 source = "dist/linode-object-storage-streaming.wasm"
 exclude_files = ["**/node_modules"]
 allowed_outbound_hosts = [
-	"https://spin-s3-streaming-test.nl-ams-1.linodeobjects.com",
-	"https://raw.githubusercontent.com",
+	"https://data2.de-fra-1.linodeobjects.com",
+	"https://raw.githubusercontent.com"
 ]
 [component.linode-object-storage-streaming.build]
 command = "npm install && npm run build"
